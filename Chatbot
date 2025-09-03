@@ -1,0 +1,142 @@
+import os
+import json
+import time
+import requests
+from google import genai  # Make sure google-genai is installed
+
+# -----------------------------
+# Configuration
+# -----------------------------
+GEMINI_API_KEY = "AIzaSyCIGikj_Md67ioKqEpa1B-y_nqbf2a0efA"
+DEEPSEEK_API_KEY = "sk-8a039460f18d43d6a497e001fe5cb9d1"
+CONV_FILE = "conversation.json"
+
+student_info = {
+    "name": "Riya",
+    "class": "9",
+    "subject": "Mathematics",
+    "chapter": ["Quadratic Equations , Cubic equations"],
+    "progress": "3 of 5 lessons completed",
+    "next_reward": "Algebra Badge 🏅"
+}
+
+# -----------------------------
+# Initialize Gemini client
+# -----------------------------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# -----------------------------
+# System prompt for ERA
+# -----------------------------
+SYSTEM_PROMPT = {
+    "role": "user",
+    "parts": [
+        {"text": (
+            "You are ERA, the student's personal AI tutor in a gamified learning platform. "
+            "Never mention being an AI, API, or language model. "
+            "Use the student's name, class, subject, progress, pending tasks, and rewards to personalize responses. "
+            "Provide clear, step-by-step solutions, hints before full answers, examples, structured steps, and emojis (🎯🏅✅). "
+            "\n\n"
+            "✅ Rules:\n"
+            "- Always attempt to solve any academic question the student asks in their subject. "
+            "Do NOT refuse a question just because it is outside the current chapter. "
+            "- If the question is completely unrelated to the subject or studying, politely redirect the student to focus on learning and rewards. "
+            "- Use student info to motivate, celebrate progress, and guide learning. "
+            "- Keep answers fun, personalized, and study-focused."
+        )}
+    ]
+}
+
+# -----------------------------
+# Initialize conversation
+# -----------------------------
+if os.path.exists(CONV_FILE):
+    with open(CONV_FILE, "r", encoding="utf-8") as f:
+        history = json.load(f)
+    if not history or history[0]["parts"][0]["text"] != SYSTEM_PROMPT["parts"][0]["text"]:
+        history.insert(0, SYSTEM_PROMPT)
+else:
+    history = [SYSTEM_PROMPT]
+
+# Inject student info
+student_context = (
+    f"Student Info:\n"
+    f"Name: {student_info['name']}\n"
+    f"Class: {student_info['class']}\n"
+    f"Subject: {student_info['subject']}\n"
+    f"Chapter: {student_info['chapter']}\n"
+    f"Progress: {student_info['progress']}\n"
+    f"Next Reward: {student_info['next_reward']}"
+)
+history.append({"role": "user", "parts": [{"text": student_context}]})
+
+# -----------------------------
+# DeepSeek API fallback
+# -----------------------------
+def call_deepseek(user_input):
+    url = "https://api.deepseek.ai/v1/query"  # Confirm correct endpoint in your docs
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "query": user_input,
+        "context": "Math tutoring for student"
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        answer = data.get("answer") or str(data)
+        return f"ERA (DeepSeek fallback): {answer}"
+    except Exception as e:
+        return f"ERA fallback: Could not reach DeepSeek, focusing on your study goals 🎯! (Error: {e})"
+
+# -----------------------------
+# Call Gemini
+# -----------------------------
+def call_gemini(history, retries=3):
+    for i in range(retries):
+        try:
+            return gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=history
+            ).text.strip()
+        except Exception as e:
+            if "503" in str(e) or "unavailable" in str(e).lower():
+                wait = 2 ** i
+                print(f"Gemini overloaded. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    return None
+
+# -----------------------------
+# Chat loop
+# -----------------------------
+print("Chat with ERA! Type 'exit' to quit.\n")
+
+while True:
+    user_input = input("You: ")
+    if user_input.lower() == "exit":
+        print("Exiting. Goodbye!")
+        break
+
+    # Add user input to history
+    history.append({"role": "user", "parts": [{"text": user_input}]})
+
+    # Call Gemini
+    ai_reply = call_gemini(history)
+    if ai_reply is None:
+        print("Gemini unavailable, using DeepSeek fallback...")
+        ai_reply = call_deepseek(user_input)
+
+    # Display reply
+    print("ERA:", ai_reply)
+
+    # Save AI reply to history
+    history.append({"role": "model", "parts": [{"text": ai_reply}]})
+
+    # Persist conversation
+    with open(CONV_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
