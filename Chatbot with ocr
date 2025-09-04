@@ -1,0 +1,146 @@
+import os
+import json
+import time
+from flask import Flask, request, jsonify
+import cv2
+import pytesseract
+import numpy as np
+from google import genai
+
+# -----------------------------
+# Tesseract configuration
+# -----------------------------
+pytesseract.pytesseract.tesseract_cmd = r"E:\tesseract\tesseract.exe"
+
+# -----------------------------
+# API keys
+# -----------------------------
+GEMINI_API_KEY = "AIzaSyCIGikj_Md67ioKqEpa1B-y_nqbf2a0efA"
+DEEPSEEK_API_KEY = "sk-8a039460f18d43d6a497e001fe5cb9d1"
+CONV_FILE = "conversation.json"
+
+# -----------------------------
+# Student info
+# -----------------------------
+student_info = {
+    "name": "Riya",
+    "class": "9",
+    "subject": "Mathematics",
+    "chapter": ["Quadratic Equations", "Cubic Equations"],
+    "progress": "3 of 5 lessons completed",
+    "next_reward": "Algebra Badge 🏅"
+}
+
+# -----------------------------
+# Initialize Gemini client
+# -----------------------------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# -----------------------------
+# Initialize conversation
+# -----------------------------
+SYSTEM_PROMPT = {
+    "role": "user",
+    "parts": [{"text": "You are ERA, the student's personal AI tutor. "
+                       "Never mention API or being an AI. Use student info and give step-by-step solutions."}]
+}
+
+if os.path.exists(CONV_FILE):
+    with open(CONV_FILE, "r", encoding="utf-8") as f:
+        history = json.load(f)
+    if not history or history[0]["parts"][0]["text"] != SYSTEM_PROMPT["parts"][0]["text"]:
+        history.insert(0, SYSTEM_PROMPT)
+else:
+    history = [SYSTEM_PROMPT]
+
+# Add student info
+student_context = f"Student Info: {json.dumps(student_info)}"
+history.append({"role": "user", "parts": [{"text": student_context}]})
+
+
+# -----------------------------
+# OCR for images
+# -----------------------------
+def preprocess_handwriting(img_path):
+    img = cv2.imread(img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.medianBlur(gray, 3)
+    thresh = cv2.adaptiveThreshold(
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 15, 8
+    )
+    resized = cv2.resize(thresh, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+    return resized
+
+
+def extract_text(img_path):
+    preprocessed = preprocess_handwriting(img_path)
+    custom_config = r"--oem 3 --psm 6 -l eng+equ"
+    text = pytesseract.image_to_string(preprocessed, config=custom_config)
+    return text.strip()
+
+
+# -----------------------------
+# Gemini call (no API disclosure)
+# -----------------------------
+def call_gemini(history, retries=3):
+    for i in range(retries):
+        try:
+            return gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=history
+            ).text.strip()
+        except Exception:
+            time.sleep(2 ** i)
+    return "Hmm, let's work on this step together! 🎯"
+
+
+# -----------------------------
+# Flask App
+# -----------------------------
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    user_input = data.get("message", "").strip()
+
+    # Check if an image is uploaded
+    img_file = data.get("image")
+    if img_file:
+        img_path = os.path.join(UPLOAD_FOLDER, img_file)
+        extracted_text = extract_text(img_path)
+        user_input = extracted_text
+
+    # Add user input to history
+    history.append({"role": "user", "parts": [{"text": user_input}]})
+
+    # Get ERA's reply
+    ai_reply = call_gemini(history)
+
+    # Save to history
+    history.append({"role": "model", "parts": [{"text": ai_reply}]})
+    with open(CONV_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    return jsonify({"reply": ai_reply})
+
+
+@app.route("/upload", methods=["POST"])
+def upload_image():
+    if "file" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(filepath)
+    return jsonify({"filename": file.filename})
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
