@@ -1,0 +1,202 @@
+import os
+import json
+import fitz  # pip install PyMuPDF
+import pytesseract  # pip install pytesseract
+from PIL import Image
+import google.generativeai as genai  # pip install google-generativeai
+from rich.console import Console
+from rich.table import Table
+
+# Initialize console for pretty output
+console = Console()
+
+# --- CONFIGURATION ---
+API_KEY = "AIzaSyDv-uu_Y3NU1h7pJ4JlrrXI4yeGHqR0GgY"  # Replace with your Google API key
+CHUNK_SIZE = 600  # words per chunk
+POINTS_PER_QUESTION = 10
+TIME_PER_QUESTION = 30  # seconds
+
+# Configure the API
+genai.configure(api_key=API_KEY)
+
+# Use Gemini 2.5 Flash model (fast and efficient)
+MODEL_NAME = 'models/gemini-2.5-flash'
+
+# Create the model instance
+model = genai.GenerativeModel(MODEL_NAME)
+
+# --------------------------
+# PDF TEXT EXTRACTION
+# --------------------------
+def extract_text(pdf_path):
+    """Extracts text from PDF using PyMuPDF and OCR fallback."""
+    text = ""
+    doc = fitz.open(pdf_path)
+    for page_number, page in enumerate(doc, 1):
+        page_text = page.get_text()
+        if not page_text.strip():  # OCR fallback if PDF has images
+            pix = page.get_pixmap()
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_text = pytesseract.image_to_string(img)
+        text += page_text + "\n"
+        console.print(f"[green]Processed page {page_number}/{len(doc)}[/]")
+    return text
+
+# --------------------------
+# TEXT CHUNKING
+# --------------------------
+def split_text_into_chunks(text, chunk_size=CHUNK_SIZE):
+    words = text.split()
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+# --------------------------
+# GOOGLE GENERATIVEAI FUNCTIONS (Using Gemini 2.5 Flash)
+# --------------------------
+def summarize_text(chunk):
+    """Summarizes a text chunk."""
+    prompt = f"Summarize the following text in 3-5 sentences:\n\n{chunk}"
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        console.print(f"[red]Error generating summary: {e}[/]")
+        return f"Error: Could not generate summary. {str(e)}"
+
+def generate_quiz(summary):
+    """Generates 5 multiple-choice questions from summary."""
+    prompt = f"""
+Create 5 multiple-choice questions from the following summary.
+Each question must have 4 options and one correct answer.
+Return JSON like this:
+
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+      "correctAnswer": "Option 2"
+    }}
+  ]
+}}
+
+Summary: {summary}
+"""
+    try:
+        response = model.generate_content(prompt)
+        
+        # Clean JSON
+        json_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(json_text)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Error parsing JSON response: {e}[/]")
+        console.print(f"[yellow]Raw response: {response.text if 'response' in locals() else 'No response'}[/]")
+        # Return a fallback quiz structure
+        return {
+            "questions": [
+                {
+                    "question": "Could not generate questions due to API error",
+                    "options": ["Error", "Error", "Error", "Error"],
+                    "correctAnswer": "Error"
+                }
+            ]
+        }
+    except Exception as e:
+        console.print(f"[red]Error generating quiz: {e}[/]")
+        return {
+            "questions": [
+                {
+                    "question": "Could not generate questions due to API error",
+                    "options": ["Error", "Error", "Error", "Error"],
+                    "correctAnswer": "Error"
+                }
+            ]
+        }
+
+# --------------------------
+# QUIZ INTERACTION
+# --------------------------
+def run_quiz(quiz_data):
+    user_answers = []
+    total = len(quiz_data["questions"])
+    
+    for i, q in enumerate(quiz_data["questions"], 1):
+        console.print(f"\nQuestion {i}/{total}: [bold cyan]{q['question']}[/]")
+        for idx, opt in enumerate(q["options"]):
+            console.print(f"  {chr(65+idx)}. {opt}")
+        
+        answer = console.input(f"[yellow]Your answer (A-D, {TIME_PER_QUESTION}s limit): [/]").strip().upper()
+        if answer in ["A","B","C","D"]:
+            selected = q["options"][ord(answer)-65]
+        else:
+            selected = None
+
+        user_answers.append({
+            "answer": selected,
+            "correct": selected == q["correctAnswer"],
+            "correctAnswer": q["correctAnswer"]
+        })
+    return user_answers
+
+# --------------------------
+# RESULTS DISPLAY
+# --------------------------
+def show_results(user_answers):
+    score = sum(POINTS_PER_QUESTION for ua in user_answers if ua["correct"])
+    console.print(f"\n[bold green]Your Score: {score} points[/]\n")
+
+    table = Table(title="Quiz Results", show_lines=True)
+    table.add_column("Question #", justify="center")
+    table.add_column("Your Answer")
+    table.add_column("Correct Answer")
+    table.add_column("Result", justify="center")
+
+    for idx, ua in enumerate(user_answers, 1):
+        result = "✅" if ua["correct"] else "❌"
+        table.add_row(str(idx), str(ua["answer"] or "No Answer"), ua["correctAnswer"], result)
+    
+    console.print(table)
+
+# --------------------------
+# MAIN FUNCTION
+# --------------------------
+def main():
+    console.print(f"[blue]Using model: {MODEL_NAME}[/]")
+
+    pdf_path = console.input("Enter path to your PDF file: ").strip()
+    if not os.path.exists(pdf_path):
+        console.print("[red]PDF file not found![/]")
+        return
+
+    console.print("[blue]Extracting text from PDF...[/]")
+    text = extract_text(pdf_path)
+    
+    if not text.strip():
+        console.print("[red]No text could be extracted from the PDF![/]")
+        return
+        
+    chunks = split_text_into_chunks(text)
+    console.print(f"[green]Split into {len(chunks)} chunks[/]")
+
+    all_answers = []
+
+    for idx, chunk in enumerate(chunks, 1):
+        console.print(f"\n[blue]Processing chunk {idx}/{len(chunks)}[/]")
+        console.print(f"[dim]Chunk preview: {chunk[:100]}...[/]")
+        
+        summary = summarize_text(chunk)
+        if summary.startswith("Error:"):
+            console.print(f"[red]Skipping chunk due to error: {summary}[/]")
+            continue
+            
+        console.print(f"[green]Summary generated: {summary[:100]}...[/]")
+        
+        quiz_data = generate_quiz(summary)
+        user_answers = run_quiz(quiz_data)
+        all_answers.extend(user_answers)
+
+    show_results(all_answers)
+
+# --------------------------
+if __name__ == "__main__":
+    main()
